@@ -11,8 +11,8 @@ export default defineConfig({
     registerType: 'autoUpdate',
     includeAssets: ['icon.svg'],
     manifest: {
-      name: 'XRAY Camera — Skeleton FX',
-      short_name: 'XRAY Camera',
+      name: 'Xray',
+      short_name: 'Xray',
       description: 'Simulated X-ray skeleton camera effect',
       start_url: base,
       scope: base,
