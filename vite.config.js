@@ -3,7 +3,7 @@ import react from '@vitejs/plugin-react';
 import { VitePWA } from 'vite-plugin-pwa';
 
 // GitHub Actions sets this automatically for repository Pages.
-const base = process.env.GITHUB_PAGES_BASE || '/';
+const base = process.env.GITHUB_PAGES_BASE || '/xray/';
 
 export default defineConfig({
   base,
