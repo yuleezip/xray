@@ -3,18 +3,51 @@ import {FilesetResolver,PoseLandmarker} from '@mediapipe/tasks-vision';
 import {drawAnatomy} from './skeleton';
 import './style.css';
 const MODEL='https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
-const WASM='https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm';
+const WASM_SOURCES=[
+ 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm',
+ 'https://unpkg.com/@mediapipe/tasks-vision@0.10.22/wasm'
+];
+const MODEL_SOURCES=[MODEL,'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task'];
+async function withTimeout(task,ms,label){let timer;try{return await Promise.race([task,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error(`${label} timed out after ${Math.round(ms/1000)}s`)),ms)})])}finally{clearTimeout(timer)}}
+async function fetchModel(url){const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),18000);try{const response=await fetch(url,{signal:controller.signal,cache:'no-store'});if(!response.ok)throw new Error(`Model download: HTTP ${response.status}`);const buffer=await response.arrayBuffer();if(buffer.byteLength<100000)throw new Error('Downloaded model is unexpectedly small');return new Uint8Array(buffer)}finally{clearTimeout(timer)}}
 const INITIAL={mode:'xray',opacity:.9,background:.56,scanlines:true,grid:false,mirror:true};
 function Icon({name,size=22}){const shared={width:size,height:size,viewBox:'0 0 24 24',fill:'none',stroke:'currentColor',strokeWidth:1.85,strokeLinecap:'round',strokeLinejoin:'round'};const paths={settings:<><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="2" fill="#090909"/><circle cx="16" cy="17" r="2" fill="#090909"/></>,flip:<><path d="M4 12a8 8 0 0 1 14-5l2 2M20 12a8 8 0 0 1-14 5l-2-2"/><path d="M20 4v5h-5M4 20v-5h5"/></>,flash:<path d="m13 2-9 12h7l-1 8 10-12h-7l0-8Z"/>,close:<path d="M5 5l14 14M19 5 5 19"/>,download:<><path d="M12 3v12m-5-5 5 5 5-5M4 17v4h16v-4"/></>,info:<><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/></>};return <svg {...shared} aria-hidden="true">{paths[name]}</svg>}
 export default function App(){
  const video=useRef(null),canvas=useRef(null),landmarker=useRef(null),stream=useRef(null),raf=useRef(0),running=useRef(false),starting=useRef(false),lastInference=useRef(0),lastVideoTime=useRef(-1),lastPose=useRef(null),lastStatus=useRef(''),settingsRef=useRef(INITIAL),cameraRef=useRef('environment');
- const [active,setActive]=useState(false),[busy,setBusy]=useState(false),[status,setStatus]=useState('READY TO SCAN'),[error,setError]=useState(''),[modelState,setModelState]=useState('idle'),[facing,setFacing]=useState('environment'),[settings,setSettings]=useState(INITIAL),[panel,setPanel]=useState(false),[photo,setPhoto]=useState(null),[showInfo,setShowInfo]=useState(false);
+ const [active,setActive]=useState(false),[busy,setBusy]=useState(false),[status,setStatus]=useState('READY TO SCAN'),[error,setError]=useState(''),[modelState,setModelState]=useState('idle'),[facing,setFacing]=useState('environment'),[settings,setSettings]=useState(INITIAL),[panel,setPanel]=useState(false),[photo,setPhoto]=useState(null),[showInfo,setShowInfo]=useState(false),[modelError,setModelError]=useState('');
  useEffect(()=>{settingsRef.current=settings},[settings]);
  const update=(key,value)=>setSettings(s=>{const next={...s,[key]:value};settingsRef.current=next;return next});
  function report(s){if(lastStatus.current!==s){lastStatus.current=s;setStatus(s)}}
  function stop(){running.current=false;cancelAnimationFrame(raf.current);stream.current?.getTracks().forEach(t=>t.stop());stream.current=null;if(video.current){video.current.pause();video.current.srcObject=null;}lastPose.current=null;setActive(false)}
  useEffect(()=>()=>{stop();landmarker.current?.close()},[]);
- async function loadModel(){if(landmarker.current)return;setModelState('loading');report('LOADING SKELETON MODEL');try{const files=await FilesetResolver.forVisionTasks(WASM);let model;try{model=await PoseLandmarker.createFromOptions(files,{baseOptions:{modelAssetPath:MODEL,delegate:'GPU'},runningMode:'VIDEO',numPoses:1,minPoseDetectionConfidence:.5,minTrackingConfidence:.5})}catch{model=await PoseLandmarker.createFromOptions(files,{baseOptions:{modelAssetPath:MODEL,delegate:'CPU'},runningMode:'VIDEO',numPoses:1})}landmarker.current=model;setModelState('ready');report('FIND A PERSON')}catch(e){console.error(e);setModelState('error');report('CAMERA ON · MODEL UNAVAILABLE');setError('Camera is working, but the skeleton model could not load. Check your internet connection and tap Retry Model.')}}
+ async function loadModel(){
+  if(landmarker.current)return;
+  setModelState('loading');setModelError('');report('LOADING SKELETON MODEL');
+  const failures=[];
+  for(const wasmUrl of WASM_SOURCES){
+   let files;
+   try{report('LOADING TRACKING ENGINE');files=await withTimeout(FilesetResolver.forVisionTasks(wasmUrl),16000,'Tracking engine')}catch(e){failures.push(`WASM ${new URL(wasmUrl).host}: ${e.message}`);continue}
+   for(const modelUrl of MODEL_SOURCES){
+    let bytes;
+    try{report('DOWNLOADING POSE MODEL');bytes=await fetchModel(modelUrl)}catch(e){failures.push(`Model ${new URL(modelUrl).host}: ${e.message}`);continue}
+    // CPU first: iOS Safari devices can fail to create the GPU WebGL context.
+    for(const delegate of ['CPU','GPU']){
+     try{
+      report(`STARTING ${delegate} TRACKER`);
+      const instance=await withTimeout(PoseLandmarker.createFromOptions(files,{
+       baseOptions:{modelAssetBuffer:new Uint8Array(bytes),delegate},runningMode:'VIDEO',numPoses:1,
+       minPoseDetectionConfidence:.45,minPosePresenceConfidence:.45,minTrackingConfidence:.45
+      }),20000,`${delegate} tracker`);
+      landmarker.current=instance;setModelState('ready');setModelError('');setError('');report('FIND A PERSON');return;
+     }catch(e){failures.push(`${delegate}: ${e.message}`)}
+    }
+   }
+  }
+  const summary=failures.slice(-4).join(' | ')||'Unknown initialization error';
+  console.error('Xray model initialization failed:',failures);
+  setModelState('error');setModelError(summary);report('MODEL UNAVAILABLE');
+  setError('Skeleton tracking could not start. Check network access and tap Retry Model.');
+ }
  async function start(selected=cameraRef.current){if(starting.current)return;starting.current=true;setBusy(true);setError('');stop();try{
  if(!navigator.mediaDevices?.getUserMedia)throw new Error('Camera access requires HTTPS. Open the GitHub Pages URL in Safari on your iPhone.');
  report('REQUESTING CAMERA');let s;try{s=await navigator.mediaDevices.getUserMedia({audio:false,video:{facingMode:{ideal:selected},width:{ideal:1280},height:{ideal:720},frameRate:{ideal:30,max:30}}})}catch(e){if(e.name==='OverconstrainedError')s=await navigator.mediaDevices.getUserMedia({video:true,audio:false});else throw e}
@@ -32,6 +65,8 @@ export default function App(){
  <header className="topbar"><button className="roundButton" aria-label="Settings" onClick={()=>setPanel(true)}><Icon name="settings"/></button><div className="topTitle">Xray</div><button className="roundButton" aria-label="Information" onClick={()=>setShowInfo(true)}><Icon name="info"/></button></header>
  <div className="cameraState"><span className={'stateDot '+(active?'live':'')}/>{status}</div>
  {!active&&<div className="startOverlay"><div className="focusCorners"><span/><span/><span/><span/></div><div className="startText"><div className="scanSymbol">◎</div><h1>Xray</h1><p>Live simulated skeleton camera</p><button className="startButton" disabled={busy} onClick={()=>start()}>{busy?'OPENING CAMERA…':'ENABLE CAMERA'}</button>{error&&<p className="errorMessage">{error}</p>}</div></div>}
+ {active&&modelState==='error'&&<div className="modelAlert" role="alert"><b>Skeleton model unavailable</b><span>{modelError||'Model initialization failed'}</span><button onClick={()=>void loadModel()}>Retry Model</button></div>}
+ {active&&modelState==='loading'&&<div className="modelLoading" role="status">Loading Xray tracking…</div>}
  {active&&<div className="guide"><span/><span/><span/><span/></div>}
  <div className="cameraBottom"><div className="modeSwitcher"><button className={mode==='normal'?'chosen':''} onClick={()=>update('mode','normal')}>ORIGINAL</button><button className={mode==='xray'?'chosen':''} onClick={()=>{update('mode','xray');report(landmarker.current?'FIND A PERSON':'LOADING SKELETON MODEL')}}>X-RAY</button></div><div className="shutterRow"><button className="lastShot" aria-label="Last photo" onClick={()=>photo&&window.open(photo,'_blank')}>{photo?<img src={photo} alt="Last captured photo"/>:<span className="galleryPlaceholder">▧</span>}</button><button className="shutter" aria-label="Capture photo" disabled={!active} onClick={capture}><span/></button><button className="flipButton" aria-label="Switch camera" disabled={!active||busy} onClick={()=>start(facing==='user'?'environment':'user')}><Icon name="flip" size={26}/></button></div><div className="footnote">SIMULATED ANATOMY · NOT MEDICAL IMAGING</div></div>
  {panel&&<div className="sheetScrim" onClick={()=>setPanel(false)}><section className="settingsSheet" onClick={e=>e.stopPropagation()}><div className="sheetHandle"/><div className="sheetHeader"><h2>Camera Settings</h2><button className="roundButton" onClick={()=>setPanel(false)} aria-label="Close settings"><Icon name="close"/></button></div><div className="settingGroup"><div className="settingLabel">SKELETON INTENSITY <b>{Math.round(settings.opacity*100)}%</b></div><input type="range" min="0" max="1" step=".05" value={settings.opacity} onChange={e=>update('opacity',+e.target.value)}/><div className="settingLabel">CAMERA VISIBILITY <b>{Math.round(settings.background*100)}%</b></div><input type="range" min="0" max="1" step=".05" value={settings.background} onChange={e=>update('background',+e.target.value)}/></div><div className="settingGroup toggles">{[['scanlines','Scanlines'],['grid','Alignment Grid'],['mirror','Mirror Front Camera']].map(([key,label])=><label key={key} className="toggleRow"><span>{label}</span><input type="checkbox" checked={settings[key]} onChange={e=>update(key,e.target.checked)}/><span className="switch"/></label>)}</div><div className="settingGroup"><p className="settingLabel">TRACKING</p><div className="modelRow"><span>{modelState==='ready'?'Skeleton tracking ready':modelState==='loading'?'Loading skeleton model…':modelState==='error'?'Skeleton model unavailable':'Start camera to load model'}</span><button onClick={()=>{landmarker.current?.close();landmarker.current=null;void loadModel()}} disabled={!active||modelState==='loading'}>Retry Model</button></div></div><button className="doneButton" onClick={()=>setPanel(false)}>Done</button></section></div>}
