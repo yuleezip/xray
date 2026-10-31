@@ -21,6 +21,6 @@ export default defineConfig({
       theme_color: '#050d16',
       icons: [{ src: `${base}icon.svg`, sizes: 'any', type: 'image/svg+xml', purpose: 'any' }]
     },
-    workbox: { navigateFallback: `${base}index.html`, globPatterns: ['**/*.{js,css,html,svg,png}'] }
+    workbox: { navigateFallback: `${base}index.html`, globPatterns: ['**/*.{js,css,html,svg,png,wasm,task}'], maximumFileSizeToCacheInBytes: 12000000 }
   })]
 });

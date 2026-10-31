@@ -2,14 +2,16 @@ import React, {useEffect,useRef,useState} from 'react';
 import {FilesetResolver,PoseLandmarker} from '@mediapipe/tasks-vision';
 import {drawAnatomy} from './skeleton';
 import './style.css';
-const MODEL='https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task';
-const WASM_SOURCES=[
- 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.22/wasm',
- 'https://unpkg.com/@mediapipe/tasks-vision@0.10.22/wasm'
-];
-const MODEL_SOURCES=[MODEL,'https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_full/float16/1/pose_landmarker_full.task'];
-async function withTimeout(task,ms,label){let timer;try{return await Promise.race([task,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error(`${label} timed out after ${Math.round(ms/1000)}s`)),ms)})])}finally{clearTimeout(timer)}}
-async function fetchModel(url){const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),18000);try{const response=await fetch(url,{signal:controller.signal,cache:'no-store'});if(!response.ok)throw new Error(`Model download: HTTP ${response.status}`);const buffer=await response.arrayBuffer();if(buffer.byteLength<100000)throw new Error('Downloaded model is unexpectedly small');return new Uint8Array(buffer)}finally{clearTimeout(timer)}}
+// Serve the WASM and pose model from this GitHub Pages site, not a CDN on the phone.
+const ASSET_BASE=import.meta.env.BASE_URL;
+const WASM_LOCAL=new URL(`${ASSET_BASE}wasm/`,window.location.origin).href;
+const MODEL_LOCAL=new URL(`${ASSET_BASE}models/pose_landmarker_lite.task`,window.location.origin).href;
+const errorText=(e)=>{
+ if(e instanceof Error) return `${e.name}: ${e.message}`;
+ if(typeof e==='string') return e;
+ try {return JSON.stringify(e) || String(e)} catch {return String(e)}
+};
+function timeout(promise,ms,label){let timer;return Promise.race([promise,new Promise((_,reject)=>{timer=setTimeout(()=>reject(new Error(`${label}: timed out after ${ms/1000}s`)),ms)})]).finally(()=>clearTimeout(timer))}
 const INITIAL={mode:'xray',opacity:.9,background:.56,scanlines:true,grid:false,mirror:true};
 function Icon({name,size=22}){const shared={width:size,height:size,viewBox:'0 0 24 24',fill:'none',stroke:'currentColor',strokeWidth:1.85,strokeLinecap:'round',strokeLinejoin:'round'};const paths={settings:<><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="2" fill="#090909"/><circle cx="16" cy="17" r="2" fill="#090909"/></>,flip:<><path d="M4 12a8 8 0 0 1 14-5l2 2M20 12a8 8 0 0 1-14 5l-2-2"/><path d="M20 4v5h-5M4 20v-5h5"/></>,flash:<path d="m13 2-9 12h7l-1 8 10-12h-7l0-8Z"/>,close:<path d="M5 5l14 14M19 5 5 19"/>,download:<><path d="M12 3v12m-5-5 5 5 5-5M4 17v4h16v-4"/></>,info:<><circle cx="12" cy="12" r="9"/><path d="M12 11v6M12 7h.01"/></>};return <svg {...shared} aria-hidden="true">{paths[name]}</svg>}
 export default function App(){
@@ -22,31 +24,26 @@ export default function App(){
  useEffect(()=>()=>{stop();landmarker.current?.close()},[]);
  async function loadModel(){
   if(landmarker.current)return;
-  setModelState('loading');setModelError('');report('LOADING SKELETON MODEL');
-  const failures=[];
-  for(const wasmUrl of WASM_SOURCES){
-   let files;
-   try{report('LOADING TRACKING ENGINE');files=await withTimeout(FilesetResolver.forVisionTasks(wasmUrl),16000,'Tracking engine')}catch(e){failures.push(`WASM ${new URL(wasmUrl).host}: ${e.message}`);continue}
-   for(const modelUrl of MODEL_SOURCES){
-    let bytes;
-    try{report('DOWNLOADING POSE MODEL');bytes=await fetchModel(modelUrl)}catch(e){failures.push(`Model ${new URL(modelUrl).host}: ${e.message}`);continue}
-    // CPU first: iOS Safari devices can fail to create the GPU WebGL context.
-    for(const delegate of ['CPU','GPU']){
-     try{
-      report(`STARTING ${delegate} TRACKER`);
-      const instance=await withTimeout(PoseLandmarker.createFromOptions(files,{
-       baseOptions:{modelAssetBuffer:new Uint8Array(bytes),delegate},runningMode:'VIDEO',numPoses:1,
-       minPoseDetectionConfidence:.45,minPosePresenceConfidence:.45,minTrackingConfidence:.45
-      }),20000,`${delegate} tracker`);
-      landmarker.current=instance;setModelState('ready');setModelError('');setError('');report('FIND A PERSON');return;
-     }catch(e){failures.push(`${delegate}: ${e.message}`)}
-    }
+  setModelState('loading');setModelError('');report('LOADING TRACKING ENGINE');
+  try{
+   const files=await timeout(FilesetResolver.forVisionTasks(WASM_LOCAL),25000,'Local WebAssembly');
+   report('LOADING POSE MODEL');
+   // Direct model path avoids copying/transferring the ArrayBuffer in Safari.
+   const options={baseOptions:{modelAssetPath:MODEL_LOCAL,delegate:'CPU'},runningMode:'VIDEO',numPoses:1,
+     minPoseDetectionConfidence:.45,minPosePresenceConfidence:.45,minTrackingConfidence:.45};
+   let instance;
+   try{instance=await timeout(PoseLandmarker.createFromOptions(files,options),30000,'CPU initialization')}
+   catch(cpuError){
+     console.warn('CPU initialization failed',cpuError);
+     report('TRYING GPU TRACKER');
+     try{instance=await timeout(PoseLandmarker.createFromOptions(files,{...options,baseOptions:{...options.baseOptions,delegate:'GPU'}}),30000,'GPU initialization')}
+     catch(gpuError){throw new Error(`CPU: ${errorText(cpuError)} | GPU: ${errorText(gpuError)}`)}
    }
+   landmarker.current=instance;setModelState('ready');setModelError('');report('FIND A PERSON');
+  }catch(e){
+   console.error('Xray tracker initialization error',e);
+   setModelState('error');setModelError(errorText(e));report('MODEL UNAVAILABLE');
   }
-  const summary=failures.slice(-4).join(' | ')||'Unknown initialization error';
-  console.error('Xray model initialization failed:',failures);
-  setModelState('error');setModelError(summary);report('MODEL UNAVAILABLE');
-  setError('Skeleton tracking could not start. Check network access and tap Retry Model.');
  }
  async function start(selected=cameraRef.current){if(starting.current)return;starting.current=true;setBusy(true);setError('');stop();try{
  if(!navigator.mediaDevices?.getUserMedia)throw new Error('Camera access requires HTTPS. Open the GitHub Pages URL in Safari on your iPhone.');
